@@ -4,12 +4,15 @@ import requests
 import sqlite3  
 from datetime import datetime
 from flask import Flask, request, jsonify
+import os
 
 
 app = Flask(__name__)
 
 
 folder_path = "model_trained_and_scalars/"
+API_KEY = "9d3eea34a09240d74666495d538b519f"
+BASE_URL = "https://api.openweathermap.org/data/3.0/onecall"
 # ----------------------------------------------------------------------------
 # configuration - paths to saved artifacts (adjust as needed)
 MODEL_PATH = folder_path + "model18feb.pkl"
@@ -43,21 +46,95 @@ except Exception:
 # minimal validation is performed here; expand in production.
 
 # ---------- helper utilities for backend developers ----------
+delhi_holidays_2026 = [
+    "2026-01-01",  # New Year's Day
+    "2026-01-14",  # Makar Sankranti / Pongal
+    "2026-01-26",  # Republic Day
+    "2026-03-04",  # Maha Shivaratri
+    "2026-03-21",  # Holi
+    "2026-03-31",  # Ramzan Id (Eid-ul-Fitr) *
+    "2026-04-14",  # Dr. Ambedkar Jayanti
+    "2026-04-18",  # Good Friday
+    "2026-05-01",  # Labour Day
+    "2026-05-25",  # Buddha Purnima
+    "2026-08-15",  # Independence Day
+    "2026-08-28",  # Janmashtami
+    "2026-09-17",  # Ganesh Chaturthi
+    "2026-10-02",  # Gandhi Jayanti
+    "2026-10-20",  # Dussehra
+    "2026-11-01",  # Diwali
+    "2026-11-15",  # Guru Nanak Jayanti
+    "2026-12-25"   # Christmas
+]
 
-def fetch_weather(api_url):
-    """Fetch weather from API.
-    
-    Input:
-        api_url (str): Weather API endpoint URL
-    
-    Output:
-        dict: JSON response with weather data
+def fetch_weather(): #temp juggad
     """
-    resp = requests.get(api_url, timeout=10)
-    return resp.json()
+    Fetch next 24-hour weather data from OpenWeather One Call 3.0 API.
+
+    Output:
+        list: 24 hourly weather dictionaries with:
+              temp, dewpoint, humidity,
+              windspeed, winddir, cloud, precip
+    """
+
+    # Example coordinates (Change if needed)
+    lat = 28.6448   # Pune
+    lon = 77.2167
+
+    params = {
+        "lat": lat,
+        "lon": lon,
+        "units": "metric",
+        "exclude": "minutely,daily,alerts",
+        "appid": API_KEY
+    }
+
+    try:
+        resp = requests.get(BASE_URL, params=params, timeout=10)
+        resp.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        raise Exception(f"Weather API request failed: {e}")
+
+    data = resp.json()
+
+    hourly_data = data.get("hourly", [])[:24]
+
+    if not hourly_data:
+        raise ValueError("No hourly weather data found in API response")
+
+    weather_features = []
+
+    for hour in hourly_data:
+        weather_features.append({
+            "temp": hour.get("temp"),
+            "dewpoint": hour.get("dew_point"),
+            "humidity": hour.get("humidity"),
+            "windspeed": hour.get("wind_speed"),
+            "winddir": hour.get("wind_deg"),
+            "cloud": hour.get("clouds"),
+            "precip": hour.get("rain", {}).get("1h", 0.0)
+        })
+
+    return weather_features
+
+def is_delhi_holiday(date_str):
+    return date_str in delhi_holidays_2026
 
 
-def fetch_holidays(db_path, start_date, end_date):
+@app.route("/weather", methods=["GET"])
+def weather():
+    """
+    Test route to check if weather API is working.
+    Returns 24-hour weather forecast.
+    """
+
+    try:
+        weather_data = fetch_weather()
+        return jsonify(weather_data), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+def fetch_holidays(db_path, start_date, end_date): #To be done
     """Get holidays from database.
     
     Input:
@@ -77,7 +154,7 @@ def fetch_holidays(db_path, start_date, end_date):
     return holidays
 
 
-def is_weekend(dt):
+def is_weekend(dt): #checked
     """Check if date is weekend (Sat/Sun).
     
     Input:
