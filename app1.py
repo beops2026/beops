@@ -5,14 +5,16 @@ import sqlite3
 from datetime import datetime
 from flask import Flask, request, jsonify
 import os
+import openmeteo_requests
+
+import pandas as pd
+import requests_cache
+from retry_requests import retry
 
 
 app = Flask(__name__)
 
 
-folder_path = "model_trained_and_scalars/"
-API_KEY = "9d3eea34a09240d74666495d538b519f"
-BASE_URL = "https://api.openweathermap.org/data/2.5/forecast"
 
 
 def fetch_weather():

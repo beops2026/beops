@@ -2,42 +2,60 @@ import pickle
 import numpy as np
 import requests
 import sqlite3  
-from datetime import datetime
+from datetime import datetime, timedelta
 from flask import Flask, request, jsonify
 import os
+
+import requests_cache
+import openmeteo_requests
+
+import pandas as pd
+import requests_cache
+from retry_requests import retry
 
 
 app = Flask(__name__)
 
 
-folder_path = "model_trained_and_scalars/"
-API_KEY = "9d3eea34a09240d74666495d538b519f"
-BASE_URL = "https://api.openweathermap.org/data/3.0/onecall"
 # ----------------------------------------------------------------------------
 # configuration - paths to saved artifacts (adjust as needed)
-MODEL_PATH = folder_path + "model18feb.pkl"
-FEATURE_SCALER_PATH = folder_path + "feature_scaler18feb.pkl"
-TARGET_SCALER_PATH = folder_path + "target_scaler18feb.pkl"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+folder_path = os.path.join(BASE_DIR, "model_trained_and_scalars")
+
+MODEL_PATH = os.path.join(folder_path, "model18feb.pkl")
+FEATURE_SCALER_PATH = os.path.join(folder_path, "feature_scaler18feb.pkl")
+TARGET_SCALER_PATH = os.path.join(folder_path, "target_scaler18feb.pkl")
+print("MODEL PATH:", MODEL_PATH)
+print("EXISTS:", os.path.exists(MODEL_PATH))
 
 # ----------------------------------------------------------------------------
 # load model and scalers at startup
 try:
+    print("Loading model from:", MODEL_PATH)
+
     with open(MODEL_PATH, "rb") as f:
         model = pickle.load(f)
-except Exception:
-    model = None
 
-try:
-    with open(FEATURE_SCALER_PATH, "rb") as f:
-        feature_scaler = pickle.load(f)
-except Exception:
-    feature_scaler = None
+    print("✅ Model loaded successfully")
+
+except Exception as e:
+    print("❌ MODEL LOAD ERROR:", e)
+    model = None
 
 try:
     with open(TARGET_SCALER_PATH, "rb") as f:
         target_scaler = pickle.load(f)
 except Exception:
     target_scaler = None
+
+try:
+    with open(FEATURE_SCALER_PATH, "rb") as f:
+        feature_scaler = pickle.load(f)
+    print("✅ Feature scaler loaded")
+except Exception as e:
+    print("❌ FEATURE SCALER LOAD ERROR:", e)
+    feature_scaler = None
 
 
 # helper that prepares input data for prediction
@@ -67,69 +85,94 @@ delhi_holidays_2026 = [
     "2026-12-25"   # Christmas
 ]
 
-def fetch_weather(): #temp juggad
+def fetch_weather(startDate,endDate):
     """
-    Fetch next 24-hour weather data from OpenWeather One Call 3.0 API.
+    Fetch next 24-hour weather data using Open-Meteo API
 
-    Output:
+    Returns:
         list: 24 hourly weather dictionaries with:
               temp, dewpoint, humidity,
               windspeed, winddir, cloud, precip
     """
 
-    # Example coordinates (Change if needed)
-    lat = 28.6448   # Pune
-    lon = 77.2167
+    lat = 52.52
+    lon = 13.41
+
+    # Setup cached + retry session
+    cache_session = requests_cache.CachedSession('.cache', expire_after=3600)
+    retry_session = retry(cache_session, retries=5, backoff_factor=0.2)
+
+    openmeteo = openmeteo_requests.Client(session=retry_session)
+
+    url = "https://api.open-meteo.com/v1/forecast"
 
     params = {
-        "lat": lat,
-        "lon": lon,
-        "units": "metric",
-        "exclude": "minutely,daily,alerts",
-        "appid": API_KEY
+        "latitude": lat,
+        "longitude": lon,
+        "hourly": [
+            "temperature_2m",
+            "relative_humidity_2m",
+            "dew_point_2m",
+            "precipitation",
+            "wind_speed_10m",
+            "wind_direction_10m",
+            "cloud_cover"
+        ],
+        "start_date": startDate,
+	    "end_date": endDate, 
     }
 
     try:
-        resp = requests.get(BASE_URL, params=params, timeout=10)
-        resp.raise_for_status()
-    except requests.exceptions.RequestException as e:
+        responses = openmeteo.weather_api(url, params=params,verify=False)
+    except Exception as e:
         raise Exception(f"Weather API request failed: {e}")
 
-    data = resp.json()
+    response = responses[0]
+    hourly = response.Hourly()
 
-    hourly_data = data.get("hourly", [])[:24]
+    # Extract variables (order matters)
+    temp = hourly.Variables(0).ValuesAsNumpy()
+    humidity = hourly.Variables(1).ValuesAsNumpy()
+    dewpoint = hourly.Variables(2).ValuesAsNumpy()
+    precip = hourly.Variables(3).ValuesAsNumpy()
+    windspeed = hourly.Variables(4).ValuesAsNumpy()
+    winddir = hourly.Variables(5).ValuesAsNumpy()
+    cloud = hourly.Variables(6).ValuesAsNumpy()
 
-    if not hourly_data:
-        raise ValueError("No hourly weather data found in API response")
+    # Build dataframe (optional but clean)
+    hourly_data = pd.DataFrame({
+        "temp": temp,
+        "humidity": humidity,
+        "dewpoint": dewpoint,
+        "precip": precip,
+        "windspeed": windspeed,
+        "winddir": winddir,
+        "cloud": cloud
+    })
 
-    weather_features = []
+    # ✅ Take only next 24 hours
+    hourly_data = hourly_data.head(24)
 
-    for hour in hourly_data:
-        weather_features.append({
-            "temp": hour.get("temp"),
-            "dewpoint": hour.get("dew_point"),
-            "humidity": hour.get("humidity"),
-            "windspeed": hour.get("wind_speed"),
-            "winddir": hour.get("wind_deg"),
-            "cloud": hour.get("clouds"),
-            "precip": hour.get("rain", {}).get("1h", 0.0)
-        })
+    # Convert to list of dicts (same as your old function)
+    weather_features = hourly_data.to_dict(orient="records")
+
+    if not weather_features:
+        raise ValueError("No hourly weather data found")
 
     return weather_features
-
 def is_delhi_holiday(date_str):
     return date_str in delhi_holidays_2026
 
 
-@app.route("/weather", methods=["GET"])
-def weather():
+@app.route("/hourly-weather", methods=["GET"])
+def hourly_weather():
     """
     Test route to check if weather API is working.
     Returns 24-hour weather forecast.
     """
 
     try:
-        weather_data = fetch_weather()
+        weather_data = fetch_weather("2026-03-20","2026-03-20")
         return jsonify(weather_data), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -170,21 +213,12 @@ def is_weekend(dt): #checked
 
 
 def preprocess(features):
-    """Scale and reshape features for model input.
-    
-    Input:
-        features (list): 2D list of shape (24, n_features)
-                        24 hourly records, each with all feature values
-    
-    Output:
-        np.array: Shape (1, 24, n_features) ready for model.predict()
-    """
     arr = np.array(features, dtype=float)
+
     if arr.ndim != 2 or arr.shape[0] != 24:
         raise ValueError("Input must be 24 rows of features")
 
     if feature_scaler is not None:
-        # flatten in the same way as during training
         flat = arr.reshape(-1, arr.shape[1])
         scaled = feature_scaler.transform(flat).reshape(arr.shape)
     else:
@@ -224,36 +258,104 @@ def health_check():
 
 
 
-@app.route("/predict", methods=["POST"])
-def predict():
-    """Predict next 24-hour values from posted features.
-    
-    Input:
-        POST JSON body: {"features": [[f1, f2, ...], ... , [f1, f2, ...]]}
-                       - 24 lists of feature values
-                       - Features in order: [hour, day, month, year, dayofweek, 
-                                             temp, dewpoint, humidity, windspeed, 
-                                             winddir, cloud, precip, is_holiday, is_weekend]
-    
-    Output:
-        JSON: {"predictions": [val1, val2, ..., val24]}
-              - 24 hourly prediction values (unscaled)
-    """
+@app.route("/predict", methods=["GET"])
+def predict_auto():
     if model is None:
         return jsonify({"error": "model not loaded"}), 500
 
-    data = request.get_json()
-    if not data or "features" not in data:
-        return jsonify({"error": "missing 'features' in request"}), 400
-
     try:
-        inp = preprocess(data["features"])
-        pred_raw = model.predict(inp)
-        result = postprocess(pred_raw)
-        return jsonify({"predictions": result})
-    except Exception as err:
-        return jsonify({"error": str(err)}), 500
+        # NEW: Get start & end date from UI (epoch format)
+        start_epoch = request.args.get("start_date")
+        end_epoch = request.args.get("end_date")
 
+        if not start_epoch or not end_epoch:
+            return jsonify({"error": "start_date and end_date (epoch) are required"}), 400
+
+        # Convert epoch → datetime
+        start_dt = datetime.fromtimestamp(int(start_epoch))
+        end_dt = datetime.fromtimestamp(int(end_epoch))
+
+        # Convert to required formats
+        start_date = start_dt.strftime("%Y-%m-%d")
+        end_date = end_dt.strftime("%Y-%m-%d")
+
+        # (Optional: dd-mm-yyyy if needed somewhere)
+        formatted_start = start_dt.strftime("%d-%m-%Y")
+        formatted_end = end_dt.strftime("%d-%m-%Y")
+
+        # Step 2: Fetch weather data (range)
+        weather_data = fetch_weather(start_date, end_date)
+
+        features = []
+
+        for i, w in enumerate(weather_data):
+            # IMPORTANT: build datetime sequentially from start date
+            dt = start_dt.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(hours=i)
+
+            hour = dt.hour
+            day = dt.day
+            month = dt.month
+            year = dt.year
+            dayofweek = dt.weekday()
+
+            # Step 4: Holiday & weekend
+            is_holiday = int(is_delhi_holiday(start_date))
+            weekend_flag = int(is_weekend(dt))
+
+            # Step 5: Combine ALL features in correct order
+            row = [
+                hour,
+                day,
+                month,
+                year,
+                dayofweek,
+                w["temp"],
+                w["dewpoint"],
+                w["humidity"],
+                w["windspeed"],
+                w["winddir"],
+                w["cloud"],
+                w["precip"],
+                is_holiday,
+                weekend_flag
+            ]
+
+            features.append(row)
+
+        # Step 6: Preprocess
+        inp = preprocess(features)
+
+        # Step 7: Predict
+        pred_raw = model.predict(inp)
+
+        # Step 8: Postprocess
+        result = postprocess(pred_raw)
+
+        # Safety: ensure alignment
+        if len(result) != len(features):
+            result = result[:len(features)]
+
+        # Start from midnight of start_date
+        base_time = start_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+
+        response_data = []
+
+        for i, value in enumerate(result):
+            dt = base_time + timedelta(hours=i)
+            unix_time = int(dt.timestamp())
+
+            response_data.append({
+                "time": unix_time,
+                "value": float(value)
+            })
+
+        return jsonify({
+            "status": "success",
+            "predictions": response_data,
+        })
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":
     # optional debug flag; in production use gunicorn or similar
